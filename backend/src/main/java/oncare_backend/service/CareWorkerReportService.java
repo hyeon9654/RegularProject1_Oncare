@@ -1,0 +1,279 @@
+package oncare_backend.service;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import oncare_backend.model.dto.AssignCareworkerDto;
+import oncare_backend.model.dto.AssignmentActionDto;
+import oncare_backend.model.dto.CareworkerDto;
+import org.springframework.beans.factory.annotation.Autowired;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+
+import oncare_backend.model.dto.CareworkerReportDto;
+import oncare_backend.model.entity.CareworkerEntity;
+import oncare_backend.model.entity.CareworkerReportEntity;
+import oncare_backend.model.entity.RequestEntity;
+import oncare_backend.model.repository.CareWorkerReportRepository;
+import oncare_backend.model.repository.CareWorkerRepository;
+import oncare_backend.model.repository.CareworkerReviewRepository;
+import oncare_backend.model.repository.RequestRepository;
+
+@Service
+@RequiredArgsConstructor
+@Transactional 
+public class CareWorkerReportService {
+    private final ActiveUserCheck activeUserCheck;          // 탈퇴(회원 상태 delete) 여부 확인
+
+    @Autowired private CareWorkerReportRepository careWorkerReportRepository;
+    @Autowired private CareWorkerRepository careWorkerRepository;
+    @Autowired private RequestRepository requestRepository;
+    @Autowired private CareworkerReviewRepository careworkerReviewRepository;
+    @Autowired private AutoAssignService autoAssignService;
+
+
+    // [1] 근무기록 생성
+    public boolean saveReport(CareworkerReportDto careworkerReportDto) {
+        if (careworkerReportDto.getCareworkerNo() == null || careworkerReportDto.getRequestNo() == null) return false;
+
+        // 1. dto -> entity
+        CareworkerReportEntity entity = careworkerReportDto.dtoToEntity();
+
+        // 2. FK 추가 (엔티티 주입)
+        // 요양보호사 번호 FK(careworker_no)
+        CareworkerEntity careworkerEntity = careWorkerRepository.findById(careworkerReportDto.getCareworkerNo() ).orElse(null);
+        if (careworkerEntity == null) return false;
+        entity.setCareworkerEntity(careworkerEntity);
+
+        // 서비스요청 번호 FK(request_no)
+        RequestEntity requestEntity = requestRepository.findById(careworkerReportDto.getRequestNo()).orElse(null);
+        if (requestEntity == null) return false;
+        entity.setRequestEntity(requestEntity);
+
+        // 3. 저장
+        CareworkerReportEntity saved = careWorkerReportRepository.save(entity);
+
+        // 4. 결과 검사
+        if (saved.getCareworkersReportNo() >= 1) {
+            return true;
+        }
+        return false;
+    }
+
+    // [2] 센터 별 근무기록 불러오기
+    public List<CareworkerReportDto> findAllByCenter(Integer centerNo){
+        // 1. 요양보호사 엔티티 안 -> 센터엔티티의 센터번호로 해당 센터의 요양보호사 근무기록 가져오기
+        List<CareworkerReportEntity> entities = careWorkerReportRepository.findByCareworkerEntity_CenterEntity_CenterNo(centerNo);
+
+        // 2. 뽑아온 entity -> dto화 한 후 배열에 저장
+        List<CareworkerReportDto> list = new ArrayList<>();
+        for (CareworkerReportEntity entity : entities) {
+            // 탈퇴한 보호자의 오늘 이후 방문은 제외 ( 지난 근무 기록은 보존 )
+            if (activeUserCheck.isWithdrawnVisit(entity.getRequestEntity())) continue;
+
+            CareworkerReportDto dto = CareworkerReportDto.entityToDto(entity);
+            list.add(dto);
+        }
+
+        // 3. 반환
+        return list;
+    }
+
+    // [3] 요양보호사 별 근무기록
+    public List<CareworkerReportDto> findAllByCareworker(Integer careworkerNo){
+        // 1. 해당 요양보호사의 근무기록 엔티티 모두 찾아옴
+        List<CareworkerReportEntity> entities = careWorkerReportRepository.findByCareworkerEntity_CareworkerNo(careworkerNo);
+
+        // 2. 엔티티들을 dto화하여 배열에 저장하기
+        List<CareworkerReportDto> list = new ArrayList<>();
+        for(CareworkerReportEntity entity : entities){
+            // 탈퇴한 보호자의 오늘 이후 방문은 제외 ( 지난 근무 기록은 보존 )
+            if (activeUserCheck.isWithdrawnVisit(entity.getRequestEntity())) continue;
+
+            CareworkerReportDto dto = CareworkerReportDto.entityToDto(entity);
+            list.add(dto);
+        }
+
+        return list;
+    }
+
+    // [4] 근무 기록 레코드 -> 근무기록상태 바꾸기
+    public boolean updateReport(Integer careworkersReportNo, String status){
+        // * 근무상태가 비어있으면 false 처리
+        if (status == null) return false;
+        
+        // 1. 해당하는 엔티티 하나 뽑아오기
+        CareworkerReportEntity entity = careWorkerReportRepository.findById(careworkersReportNo).orElse(null);
+        if (entity == null) return false;
+        
+        // 2. 엔티티 중 근무상태 값 변경
+        entity.setWorkStatus(status);
+
+        return true;
+    }
+
+    // [5] 근무 기록 삭제
+    public boolean deleteReport( Integer careworkersReportNo ){
+        CareworkerReportEntity entity = careWorkerReportRepository.findById(careworkersReportNo).orElse(null);
+
+        if (entity == null) return false;
+        // 리뷰가 달린 근무기록은 삭제하지 않음 ( 외래키 오류 500 방지 )
+        if (careworkerReviewRepository.findByCareworkerReportEntity(entity) != null) return false;
+
+        careWorkerReportRepository.deleteById(careworkersReportNo);
+
+        return true;
+    }
+
+    // 요양보호사 : 배정 수락
+    public boolean acceptAssignment(AssignmentActionDto assignmentActionDto) {
+        // 근무기록에서 넘버로 조회해서 요양보호사가 수락하면 근무기록의 상태는 확정, 요청의 상태는 배정완료
+        if (assignmentActionDto.getCareworkersReportNo() == null){
+            return false;
+        }
+        CareworkerReportEntity reportEntity = careWorkerReportRepository.findById(assignmentActionDto.getCareworkersReportNo()).orElse(null);
+        if (reportEntity == null){
+            return false;
+        }
+        // 수락을 기다리는 "배정" 상태일 때만 수락할 수 있음
+        if (!"배정".equals(reportEntity.getWorkStatus())){
+            return false;
+        }
+        reportEntity.setWorkStatus("확정");                           // 근무기록
+        reportEntity.getRequestEntity().setRequestState("배정완료");   // 요청
+        return true;
+    }
+
+    // 요양보호사 : 배정 거절
+    public boolean rejectAssignment(AssignmentActionDto assignmentActionDto) {
+        // 근무기록에서 넘버로 조회해서 요양보호사가 거절하면 근무기록은 취소, 요청은 신청으로 복귀
+        if (assignmentActionDto.getCareworkersReportNo() == null){
+            return false;
+        }
+        CareworkerReportEntity reportEntity = careWorkerReportRepository.findById(assignmentActionDto.getCareworkersReportNo()).orElse(null);
+        if (reportEntity == null){
+            return false;
+        }
+        // 수락을 기다리는 "배정" 상태일 때만 취소할 수 있음
+        if (!"배정".equals(reportEntity.getWorkStatus())){
+            return false;
+        }
+        reportEntity.setWorkStatus("취소");                           // 근무기록
+        reportEntity.getRequestEntity().setRequestState("신청");   // 요청
+        return true;
+    }
+
+    // 상위 3명중 1명 선택하면 상태가 배정인 근무기록 만들기
+    public boolean assignCareworker(AssignCareworkerDto assignCareworkerDto) {
+        // 받은 요청, 요양보호사가 없으면 false
+        if (assignCareworkerDto.getCareworkerNo() == null || assignCareworkerDto.getRequestNo() == null){
+            return false;
+        }
+        CareworkerEntity findCareworker = careWorkerRepository.findById(assignCareworkerDto.getCareworkerNo()).orElse(null);
+        RequestEntity findRequest = requestRepository.findById(assignCareworkerDto.getRequestNo()).orElse(null);
+        if (findCareworker == null || findRequest == null){
+            return false;
+        }
+
+        // 가입 승인 전(승인대기)인 요양보호사는 로그인을 못 해서 수락할 수 없으므로 배정 불가
+        if (!"승인완료".equals(findCareworker.getSignState())){
+            return false;
+        }
+
+        if (!"신청".equals(findRequest.getRequestState())){
+            return false;
+        }
+
+        // 관리자가 고른 날짜 배정
+        createAssignReport(findCareworker, findRequest);
+
+        // 같은 묶음(한 번에 신청한 날짜)의 나머지 날짜도 같은 요양보호사로 배정
+        if (findRequest.getRequestGroup() != null) {
+            List<RequestEntity> group = requestRepository.findByRequestGroup(findRequest.getRequestGroup());
+            for (RequestEntity other : group) {
+                if (other.getRequestNo().equals(findRequest.getRequestNo())) continue;    // 방금 배정한 날짜
+                if (!"신청".equals(other.getRequestState())) continue;                   // 이미 담당자가 있는 날짜
+                if (!autoAssignService.isAvailable(findCareworker, other, null)) continue; // 이 날 못 가면 건너뜀
+                createAssignReport(findCareworker, other);
+            }
+        }
+
+        return true;
+    }
+
+    public List<CareworkerReportDto> findMyAssignments(Integer careworkerNo) {
+        CareworkerEntity careworkerEntity = careWorkerRepository.findById(careworkerNo).orElse(null);
+        if (careworkerEntity == null){
+            return new ArrayList<>();
+        }
+        // 해당 요양보호사번호로 근무기록 전체 조회
+        List<CareworkerReportEntity> careworkerReports = careWorkerReportRepository.findByCareworkerEntity_CareworkerNo(careworkerNo);
+        // 필터 이용해서 근무기록에 배정 상태인 것 추출
+        List<CareworkerReportEntity> list =
+                careworkerReports.stream().filter(careworkerReportEntity -> "배정".equals(careworkerReportEntity.getWorkStatus()))
+                        .filter(careworkerReportEntity -> !activeUserCheck.isWithdrawnVisit(careworkerReportEntity.getRequestEntity()))   // 탈퇴한 보호자의 방문 제외
+                        .toList();
+        // 조회용이라 dto로 변경
+        List<CareworkerReportDto> careworkerReportDtos = list.stream().map(careworkerReportEntity -> CareworkerReportDto.entityToDto(careworkerReportEntity)).toList();
+        return careworkerReportDtos;
+    }
+
+    // 요양보호사별 확정된 요청 전체조회
+    public List<CareworkerReportDto> findMyConfirmed(Integer careworkerNo) {
+        List<CareworkerReportEntity> reportList = careWorkerReportRepository.findByCareworkerEntity_CareworkerNo(careworkerNo);
+        return reportList.stream().filter(careworkerReportEntity -> "확정".equals(careworkerReportEntity.getWorkStatus()))
+                .filter(careworkerReportEntity -> !activeUserCheck.isWithdrawnVisit(careworkerReportEntity.getRequestEntity()))   // 탈퇴한 보호자의 방문 제외
+                .map(careworkerReportEntity -> CareworkerReportDto.entityToDto(careworkerReportEntity)).toList();
+    }
+
+    // 요양보호사가 확정된 요청을 취소
+    public boolean cancel(AssignmentActionDto actionDto) {
+        if (actionDto.getCareworkersReportNo() == null){
+            return false;
+        }
+        CareworkerReportEntity reportEntity = careWorkerReportRepository.findById(actionDto.getCareworkersReportNo()).orElse(null);
+        if (reportEntity == null){
+            return false;
+        }
+        // 확정 상태일때만
+        if (!"확정".equals(reportEntity.getWorkStatus())){
+            return false;
+        }
+        reportEntity.setWorkStatus("취소");
+        reportEntity.getRequestEntity().setRequestState("신청");
+        return true;
+    }
+
+    // 요양보호사 확정된 요청을 완료
+    public boolean complete(AssignmentActionDto actionDto) {
+        if (actionDto.getCareworkersReportNo() == null){
+            return false;
+        }
+        CareworkerReportEntity reportEntity = careWorkerReportRepository.findById(actionDto.getCareworkersReportNo()).orElse(null);
+        if (reportEntity == null){
+            return false;
+        }
+        // 확정 상태일때만
+        if (!"확정".equals(reportEntity.getWorkStatus())){
+            return false;
+        }
+        reportEntity.setWorkStatus("완료");
+        reportEntity.getRequestEntity().setRequestState("완료");
+        return true;
+    }
+
+    private void createAssignReport(CareworkerEntity careworker, RequestEntity request){
+        CareworkerReportEntity reportEntity = new CareworkerReportEntity();
+        reportEntity.setCareworkerEntity(careworker);
+        reportEntity.setRequestEntity(request);
+        reportEntity.setWorkStatus("배정");
+        reportEntity.setWorkDate(request.getVisitDate());
+        reportEntity.setWorkStartTime(request.getVisitStartTime());
+        reportEntity.setWorkEndTime(request.getVisitEndTime());
+        careWorkerReportRepository.save(reportEntity);
+
+        request.setRequestState("배정중");
+    }
+}
